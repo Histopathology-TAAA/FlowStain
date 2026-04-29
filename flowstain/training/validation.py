@@ -113,7 +113,7 @@ def run_validation(
 
         # Per-sample metrics
         ssim_scores = compute_ssim_batch(pred_ihc.cpu(), ihc.cpu())
-        lpips_scores = compute_lpips_batch(pred_ihc, ihc.cpu(), scale=256)
+        lpips_scores = compute_lpips_batch(pred_ihc, ihc, scale=256)
         dab = compute_dab_metrics_batch(pred_ihc.cpu(), ihc.cpu())
 
         for i in range(B):
