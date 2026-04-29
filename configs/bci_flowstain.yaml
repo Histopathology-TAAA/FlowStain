@@ -1,0 +1,19 @@
+# Inherits all defaults from mist_flowstain.yaml – override only BCI-specific values
+
+dataset: bci
+bci_dir: /data/BCI
+stains: [HER2]
+
+conditioning:
+  stain_embedding:
+    dim: 64
+    num_stains: 5                             # 4 HER2 grades (0,1+,2+,3+) + 1 null
+
+losses:
+  dab:
+    enabled: true
+    weight: 0.2
+
+logging:
+  wandb_run_name: null
+  output_dir: runs/flowstain_bci

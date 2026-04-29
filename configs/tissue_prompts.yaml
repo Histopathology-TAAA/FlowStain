@@ -1,0 +1,38 @@
+tissue_classes:
+  - invasive_carcinoma
+  - benign_epithelium
+  - stroma
+  - inflammation
+  - adipose
+  - necrosis
+  - background
+
+prompts:
+  invasive_carcinoma:
+    - "H&E histopathology image showing invasive carcinoma"
+    - "breast invasive ductal carcinoma in H&E stained tissue section"
+    - "malignant epithelial cells infiltrating stroma, H&E stain"
+  benign_epithelium:
+    - "H&E histopathology image of benign breast epithelium"
+    - "normal breast ducts and lobules in H&E stained tissue"
+    - "benign breast epithelial cells, H&E stain"
+  stroma:
+    - "H&E histopathology image of breast stroma"
+    - "fibrous connective tissue in H&E stained breast section"
+    - "desmoplastic stroma around tumor, H&E stain"
+  inflammation:
+    - "H&E histopathology image showing inflammatory infiltrate"
+    - "lymphocytic infiltration in H&E stained breast tissue"
+    - "immune cells in H&E stained tissue section"
+  adipose:
+    - "H&E histopathology image of adipose tissue"
+    - "fat cells in H&E stained breast tissue section"
+    - "adipocytes in H&E stained tissue"
+  necrosis:
+    - "H&E histopathology image showing tumor necrosis"
+    - "necrotic tissue in H&E stained breast cancer section"
+    - "ghost cells and necrotic debris, H&E stain"
+  background:
+    - "blank or background region in histopathology slide"
+    - "empty or non-tissue area in H&E stained slide"
+    - "slide background or artifact region, H&E stain"

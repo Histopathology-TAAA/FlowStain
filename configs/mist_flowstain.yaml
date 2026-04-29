@@ -1,0 +1,143 @@
+# ─── Data ──────────────────────────────────────────────────────────────────────
+dataset: mist
+mist_dir: /data/MIST
+stains: [HER2, Ki67, ER, PR]
+crop_size: 512
+augment: true
+num_workers: 4
+
+# ─── Foundation models ─────────────────────────────────────────────────────────
+foundation:
+  uni:
+    model_name: hf-hub:MahmoodLab/uni          # timm hub identifier
+    enabled: true
+    grid_size: 4                               # NxN sub-crops per 512 patch
+    subcrop_size: 224
+    output_spatial_size: 32                    # reassembled token grid
+  conch:
+    model_name: hf-hub:MahmoodLab/conch        # open_clip hub identifier
+    enabled: true
+    tissue_prompts: configs/tissue_prompts.yaml
+    cache_tissue_probs: true
+    tissue_cache_dir: null                     # defaults to output_dir/tissue_cache
+
+# ─── Autoencoder ───────────────────────────────────────────────────────────────
+autoencoder:
+  model_name: stabilityai/sd-vae-ft-mse       # or stabilityai/sd-vae-ft-ema
+  scale_factor: 0.18215                        # SD latent scale factor
+  freeze: true
+
+# ─── Flow model ────────────────────────────────────────────────────────────────
+flow:
+  source: he                                  # "he" or "noise"
+  bridge_noise:
+    enabled: true
+    sigma_max: 0.1
+  base_channels: 320
+  channel_mults: [1, 2, 4, 4]
+  num_res_blocks: 2
+  attention_resolutions: [16, 8]
+  num_inference_steps: 16
+  sampling:
+    method: euler                             # euler | heun | stochastic_euler
+
+# ─── Conditioning ──────────────────────────────────────────────────────────────
+conditioning:
+  uni:
+    enabled: true
+    mode: hybrid                              # spade | cross_attention | hybrid
+    base_channels: 512
+  stain_embedding:
+    dim: 64
+    num_stains: 5                             # 4 stains + 1 null for CFG
+
+# ─── Losses ────────────────────────────────────────────────────────────────────
+losses:
+  flow:
+    enabled: true
+    weight: 1.0
+    loss_type: huber                          # l1 | l2 | huber
+    huber_delta: 0.5
+  dab:
+    enabled: true
+    weight: 0.2
+    top_percentile: 0.10
+    histogram_bins: 256
+  perceptual:
+    enabled: false                            # enabled in phase 2
+    weight: 1.0
+    scales: [128, 256]
+  edge:
+    enabled: false                            # enabled in phase 2
+    weight: 0.5
+  pathology_feature:
+    enabled: false
+    weight: 0.1
+    model: uni                               # uni | conch
+  adversarial:
+    enabled: false                            # enabled in phase 3
+
+# ─── Tissue weighting ──────────────────────────────────────────────────────────
+tissue_weighting:
+  enabled: true
+  min_weight: 0.5
+  max_weight: 1.5
+  entropy_blend: 0.5
+  weights:
+    invasive_carcinoma: 1.35
+    benign_epithelium: 1.10
+    stroma: 1.00
+    inflammation: 1.00
+    adipose: 0.70
+    necrosis: 0.75
+    background: 0.50
+
+# ─── Training ──────────────────────────────────────────────────────────────────
+training:
+  num_epochs: 100
+  batch_size: 4
+  gradient_accumulation_steps: 1
+  mixed_precision: bf16
+  learning_rate: 1.0e-4
+  lr_scheduler: cosine_with_restarts
+  lr_warmup_steps: 1000
+  max_grad_norm: 1.0
+  ema:
+    enabled: true
+    decay: 0.999
+  cfg_dropout:
+    stain_prob: 0.10
+    uni_prob: 0.10
+    both_prob: 0.05
+  phase2_start_step: 5000          # when to start decoded rollout losses
+  phase3_start_step: 20000         # when to start adversarial training
+
+# ─── Validation ────────────────────────────────────────────────────────────────
+validation:
+  val_every_epochs: 1
+  val_every_steps: null
+  val_max_samples: 256            # -1 = full validation set
+  reuse_val_subset: true
+  wandb_num_val_images: 16
+  num_inference_steps: 16
+  dab_kl_failure_threshold: 0.5
+
+# ─── Metrics ───────────────────────────────────────────────────────────────────
+metrics:
+  fid: true
+  kid: true
+  lpips: true
+  ssim: true
+  dab: true
+  retrieval:
+    enabled: true
+    model: conch                             # gigapath | conch | uni
+
+# ─── Logging ───────────────────────────────────────────────────────────────────
+logging:
+  report_to: wandb
+  wandb_project: FlowStain
+  wandb_run_name: null                        # auto-generated if null
+  log_every_steps: 50
+  save_every_epochs: 5
+  output_dir: runs/flowstain_mist
