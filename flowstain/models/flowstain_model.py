@@ -47,8 +47,9 @@ class FlowStainModel(nn.Module):
 
         self.vae = LatentAutoencoder(vae_model_name, vae_scale_factor)
         self.uni_extractor = UNIExtractor(uni_model_name, uni_grid_size)
+        uni_dim = self.uni_extractor.feature_dim
         self.uni_processor = UNIFeatureProcessorHighRes(
-            uni_dim=1024,
+            uni_dim=uni_dim,
             base_channels=uni_base_channels,
             spatial_size=uni_grid_size,
         )
@@ -61,6 +62,7 @@ class FlowStainModel(nn.Module):
             stain_num_embeddings=stain_num_embeddings,
             stain_emb_dim=stain_emb_dim,
             uni_map_channels=self.uni_processor.channel_dims,
+            uni_token_dim=uni_dim,
             cond_mode=cond_mode,
         )
 
@@ -77,7 +79,7 @@ class FlowStainModel(nn.Module):
     @torch.no_grad()
     def encode_uni(self, uni_subcrops: torch.Tensor) -> torch.Tensor:
         """Extract UNI tokens from pre-split sub-crops [B, N, 3, 224, 224]."""
-        return self.uni_extractor(uni_subcrops)  # [B, N, 1024]
+        return self.uni_extractor(uni_subcrops)  # [B, N, D]
 
     # ── flow forward ─────────────────────────────────────────────────────────
 
@@ -87,12 +89,12 @@ class FlowStainModel(nn.Module):
         """Process UNI tokens through the trainable adapter.
 
         Args:
-            uni_tokens:    [B, N, 1024]
+            uni_tokens:    [B, N, D]
             dropout_mask:  [B] bool – True means drop UNI features for this sample
 
         Returns:
             uni_maps:   {res: tensor}
-            uni_tokens: [B, N, 1024] (possibly zeroed for dropout)
+            uni_tokens: [B, N, D] (possibly zeroed for dropout)
         """
         if dropout_mask is not None and dropout_mask.any():
             uni_tokens = uni_tokens.clone()

@@ -1,5 +1,5 @@
 """
-Frozen UNI (ViT-L/16) feature extractor.
+Frozen UNI feature extractor.
 
 Replicates UNIStainNet's 4×4 sub-crop strategy:
   - Each 512×512 patch is split into a 4×4 grid of 128×128 sub-crops.
@@ -10,8 +10,10 @@ Replicates UNIStainNet's 4×4 sub-crop strategy:
     giving a 4×4 = 16-token grid).  For higher resolution we instead
     keep all 196 patch tokens per sub-crop and pool to 8×8 or 4×4.
 
-For simplicity (and matching UNIStainNet), each sub-crop produces a
-CLS token (1024-d), reassembled to a [B, 16, 1024] dense grid (4×4).
+For simplicity (and matching UNIStainNet), each sub-crop produces one
+CLS/global token, reassembled to a [B, 16, D] dense grid (4×4).  The
+embedding dimension D is inferred from the loaded timm model because
+different UNI-family checkpoints can return 1024-d or 1536-d features.
 
 Caching: features for validation (deterministic crops) are optionally
 written to disk as .pt files keyed by a stable hash.
@@ -35,7 +37,7 @@ class UNIExtractor(nn.Module):
     of shape [B, N, 3, 224, 224] produced by the dataset (uni_subcrops),
     where N = grid_size * grid_size.
 
-    Returns spatial tokens [B, N, D] where D = 1024.
+    Returns spatial tokens [B, N, D], where D is inferred from the model.
     These are then fed to UNIFeatureProcessorHighRes.
     """
 
@@ -48,6 +50,7 @@ class UNIExtractor(nn.Module):
         self.model_name = model_name
         self.grid_size = grid_size
         self.model = self._load_model(model_name)
+        self.feature_dim = self._infer_feature_dim(self.model)
         for p in self.parameters():
             p.requires_grad = False
         self.eval()
@@ -64,6 +67,18 @@ class UNIExtractor(nn.Module):
         model.eval()
         return model
 
+    @staticmethod
+    def _infer_feature_dim(model: nn.Module) -> int:
+        """Infer output embedding dimension from a timm model."""
+        for attr in ("num_features", "embed_dim"):
+            value = getattr(model, attr, None)
+            if isinstance(value, int) and value > 0:
+                return value
+        raise AttributeError(
+            "Could not infer UNI feature dimension from the loaded model. "
+            "Expected timm model to expose `num_features` or `embed_dim`."
+        )
+
     @torch.no_grad()
     def forward(self, uni_subcrops: torch.Tensor) -> torch.Tensor:
         """Extract features from pre-split sub-crops.
@@ -72,17 +87,17 @@ class UNIExtractor(nn.Module):
             uni_subcrops: [B, N, 3, 224, 224]  N = grid_size^2
 
         Returns:
-            tokens: [B, N, 1024]  one CLS token per sub-crop
+            tokens: [B, N, D]  one CLS/global token per sub-crop
         """
         B, N, C, H, W = uni_subcrops.shape
         flat = uni_subcrops.view(B * N, C, H, W)
-        feats = self.model(flat)       # [B*N, 1024]  — CLS token
+        feats = self.model(flat)       # [B*N, D]  — CLS/global token
         tokens = feats.view(B, N, -1)  # [B, N, D]
         return tokens
 
 
 class UNIFeatureProcessorHighRes(nn.Module):
-    """Project [B, S*S, 1024] dense tokens into multi-scale spatial maps.
+    """Project [B, S*S, D] dense tokens into multi-scale spatial maps.
 
     Mirrors UNIStainNet's UNIFeatureProcessorHighRes with a few tweaks:
     – Input spatial_size = grid_size (4) for 4×4 tokens.
@@ -155,7 +170,7 @@ class UNIFeatureProcessorHighRes(nn.Module):
     def forward(self, tokens: torch.Tensor) -> Dict[int, torch.Tensor]:
         """
         Args:
-            tokens: [B, S*S, D]  e.g. [B, 16, 1024] for 4×4 grid
+            tokens: [B, S*S, D]  e.g. [B, 16, 1536] for 4×4 grid
 
         Returns:
             dict {resolution: feature_map}
@@ -163,6 +178,13 @@ class UNIFeatureProcessorHighRes(nn.Module):
         B, N, D = tokens.shape
         S = self.spatial_size
         assert N == S * S, f"Expected {S*S} tokens, got {N}"
+        expected_dim = self.proj[0].in_features
+        if D != expected_dim:
+            raise ValueError(
+                f"UNI token dimension mismatch: got {D}, but processor expects "
+                f"{expected_dim}. Build UNIFeatureProcessorHighRes with "
+                f"uni_dim=uni_extractor.feature_dim."
+            )
 
         x = self.proj(tokens)                              # [B, S*S, C]
         x = x.permute(0, 2, 1).reshape(B, -1, S, S)       # [B, C, S, S]
