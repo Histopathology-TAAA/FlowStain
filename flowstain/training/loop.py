@@ -181,9 +181,12 @@ def train(cfg: DictConfig):
             else output_dir / "tissue_cache"
         )
         conch = CONCHTissueClassifier(
-            model_name=cfg.foundation.conch.model_name,
+            model_cfg=cfg.foundation.conch.model_cfg,
+            checkpoint_path=cfg.foundation.conch.checkpoint_path,
+            hf_auth_token=cfg.foundation.conch.get("hf_auth_token") or None,
             tissue_prompts_yaml=cfg.foundation.conch.tissue_prompts,
             cache_dir=tissue_cache_dir if cfg.foundation.conch.cache_tissue_probs else None,
+            device=accelerator.device,
         ).to(accelerator.device)
 
     # Retrieval evaluator (main process only, not prepared)

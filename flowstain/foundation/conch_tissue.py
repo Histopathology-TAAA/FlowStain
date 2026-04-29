@@ -1,15 +1,23 @@
 """
-Frozen CONCH image+text encoder for zero-shot tissue classification.
+Frozen CONCH tissue classifier for zero-shot H&E tissue classification.
 
-CONCH is loaded via open_clip. The image encoder is used to classify
-H&E crops into tissue categories using per-class text prompt ensembles.
+Uses the official CONCH package API:
+  from conch.open_clip_custom import create_model_from_pretrained, tokenize, get_tokenizer
 
-Tissue probabilities are optionally cached to disk for validation crops.
-During training, CONCH runs on the fly on the H&E batch but results are
-not backpropagated (frozen, no_grad).
+Model can be loaded from HF hub (preferred) or a local checkpoint:
+  model, preprocess = create_model_from_pretrained(
+      'conch_ViT-B-16', 'hf_hub:MahmoodLab/conch', hf_auth_token=token
+  )
+  model, preprocess = create_model_from_pretrained(
+      'conch_ViT-B-16', './checkpoints/CONCH/pytorch_model.bin'
+  )
 
-Cache format: {cache_dir}/{key}.pt  where each file is a dict:
-    {"probs": tensor[num_classes], "top_class": str, "entropy": float}
+Tissue probabilities are computed as:
+  sim = model.encode_image(img) @ model.encode_text(prompts).T * model.logit_scale.exp()
+  probs = sim.softmax(dim=-1)
+
+Results are optionally cached to disk (keyed by filename + stain + model config)
+for validation crops where crops are deterministic.
 """
 
 from __future__ import annotations
@@ -17,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import math
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -47,51 +55,85 @@ class CONCHTissueClassifier(nn.Module):
     Produces per-crop tissue probability vectors used for:
     1. Loss weighting during training (tissue-aware weighted mean).
     2. Tissue-stratified validation metrics and W&B reporting.
+
+    Args:
+        model_cfg:             CONCH model config name, e.g. 'conch_ViT-B-16'.
+        checkpoint_path:       Path to the CONCH checkpoint .bin file.
+        tissue_prompts_yaml:   Path to tissue_prompts.yaml.
+        cache_dir:             Optional directory to cache per-sample tissue probs.
+        device:                Optional device. Defaults to current CUDA device.
     """
 
     def __init__(
         self,
-        model_name: str = "hf-hub:MahmoodLab/conch",
+        model_cfg: str = "conch_ViT-B-16",
+        checkpoint_path: str | Path = "hf_hub:MahmoodLab/conch",
+        hf_auth_token: Optional[str] = None,
         tissue_prompts_yaml: str | Path = "configs/tissue_prompts.yaml",
         cache_dir: Optional[Path] = None,
         device: Optional[torch.device] = None,
     ):
         super().__init__()
-        self._model_name = model_name
+        self._model_cfg = model_cfg
+        self._checkpoint_path = str(checkpoint_path)
         self._cache_dir = Path(cache_dir) if cache_dir else None
         self._device = device
 
         self.tissue_classes = TISSUE_CLASSES
         self.num_classes = len(TISSUE_CLASSES)
 
-        # Load model
-        self.model, self.preprocess, self.tokenizer = self._load_conch(model_name)
-        for p in self.parameters():
+        # Load frozen model + preprocessing transform
+        self.model, self.preprocess = self._load_conch(
+            model_cfg, checkpoint_path, device, hf_auth_token
+        )
+        for p in self.model.parameters():
             p.requires_grad = False
-        self.eval()
+        self.model.eval()
 
-        # Pre-compute text prototype embeddings
+        # Pre-compute averaged text prototype embeddings once at init
         prompts = _load_tissue_prompts(tissue_prompts_yaml)
-        text_protos = self._encode_text_prototypes(prompts)
-        self.register_buffer("text_protos", text_protos)  # [num_classes, D]
+        text_protos = self._encode_text_prototypes(prompts)  # [num_classes, D]
+        self.register_buffer("text_protos", text_protos)
 
     # ── model loading ────────────────────────────────────────────────────────
 
     @staticmethod
-    def _load_conch(model_name: str):
+    def _load_conch(
+        model_cfg: str,
+        checkpoint_path: str | Path,
+        device: Optional[torch.device] = None,
+        hf_auth_token: Optional[str] = None,
+    ):
+        """Load CONCH model and preprocessing transform.
+
+        ``checkpoint_path`` accepts:
+          - HuggingFace hub string:  ``'hf_hub:MahmoodLab/conch'``
+          - Local file path:         ``'./checkpoints/CONCH/pytorch_model.bin'``
+
+        For gated HF repos supply the user access token via ``hf_auth_token``.
+        """
         try:
-            import open_clip
-            model, preprocess_train, preprocess_val = open_clip.create_model_and_transforms(
-                model_name
+            from conch.open_clip_custom import create_model_from_pretrained
+        except ImportError:
+            raise ImportError(
+                "The 'conch' package is required for tissue classification. "
+                "Install it from https://github.com/mahmoodlab/CONCH or via pip."
             )
-            tokenizer = open_clip.get_tokenizer(model_name)
-            model.eval()
-            return model, preprocess_val, tokenizer
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load CONCH model '{model_name}'. "
-                f"Ensure open-clip-torch>=2.24 and network access.\nError: {e}"
-            )
+
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        kwargs = {}
+        if hf_auth_token:
+            kwargs["hf_auth_token"] = hf_auth_token
+
+        model, preprocess = create_model_from_pretrained(
+            model_cfg, str(checkpoint_path), device=device, **kwargs
+        )
+        model.eval()
+        return model, preprocess
+
+    # ── text encoding ────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def _encode_text_prototypes(self, prompts: Dict[str, List[str]]) -> torch.Tensor:
@@ -99,49 +141,52 @@ class CONCHTissueClassifier(nn.Module):
 
         Returns: [num_classes, D]
         """
+        try:
+            from conch.open_clip_custom import tokenize, get_tokenizer
+        except ImportError:
+            raise ImportError("conch package required for text encoding.")
+
         device = next(self.model.parameters()).device
+        tokenizer = get_tokenizer()
+
         protos = []
         for cls in TISSUE_CLASSES:
-            cls_prompts = prompts.get(cls, [f"H&E histopathology tissue: {cls.replace('_', ' ')}"])
-            tokens = self.tokenizer(cls_prompts)
-            if hasattr(tokens, "to"):
-                tokens = tokens.to(device)
-            with torch.no_grad():
-                embeds = self.model.encode_text(tokens)  # [P, D]
-                embeds = F.normalize(embeds, dim=-1)
-                proto = embeds.mean(0)
-                proto = F.normalize(proto, dim=-1)
+            cls_prompts = prompts.get(
+                cls, [f"an H&E image of {cls.replace('_', ' ')}"]
+            )
+            tokens = tokenize(texts=cls_prompts, tokenizer=tokenizer).to(device)
+            embeds = self.model.encode_text(tokens)        # [P, D]
+            embeds = F.normalize(embeds.float(), dim=-1)
+            proto = embeds.mean(0)
+            proto = F.normalize(proto, dim=-1)
             protos.append(proto)
+
         return torch.stack(protos)  # [num_classes, D]
 
     # ── image encoding ───────────────────────────────────────────────────────
 
     @torch.no_grad()
-    def _encode_images(self, images_0_1: torch.Tensor) -> torch.Tensor:
-        """Encode images [B, 3, H, W] (values 0–1) into CONCH embeddings.
+    def _encode_images(self, he_01: torch.Tensor) -> torch.Tensor:
+        """Encode a batch of H&E images [B, 3, H, W] (values 0–1).
 
-        CONCH expects input normalized with its own stats.  We apply the
-        torchvision functional version of CONCH's validation preprocess
-        (resize + center-crop + normalize).
+        Converts each image to PIL, applies CONCH's preprocess, and runs
+        through the image encoder.
 
-        Returns: [B, D]
+        Returns: [B, D]  L2-normalised embeddings
         """
+        from PIL import Image as PILImage
         import torchvision.transforms.functional as TF
 
-        # CONCH preprocess: resize to 448, center-crop to 448, normalize
-        imgs = TF.resize(images_0_1, [448], antialias=True)
-        if imgs.shape[-1] > 448 or imgs.shape[-2] > 448:
-            imgs = TF.center_crop(imgs, [448, 448])
+        device = next(self.model.parameters()).device
+        preprocessed = []
+        for i in range(he_01.shape[0]):
+            # Convert tensor [0,1] → PIL
+            pil = TF.to_pil_image(he_01[i].cpu().clamp(0, 1))
+            preprocessed.append(self.preprocess(pil))
 
-        # CONCH normalization params (OpenAI CLIP stats)
-        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073],
-                             device=images_0_1.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.26862954, 0.26130258, 0.27577711],
-                            device=images_0_1.device).view(1, 3, 1, 1)
-        imgs = (imgs - mean) / std
-
-        embeds = self.model.encode_image(imgs)
-        return F.normalize(embeds, dim=-1)  # [B, D]
+        batch = torch.stack(preprocessed).to(device)  # [B, 3, H', W']
+        embeds = self.model.encode_image(batch)
+        return F.normalize(embeds.float(), dim=-1)     # [B, D]
 
     # ── classification ───────────────────────────────────────────────────────
 
@@ -155,56 +200,50 @@ class CONCHTissueClassifier(nn.Module):
         """Classify H&E crops into tissue categories.
 
         Args:
-            he_tensor: [B, 3, H, W] in [-1, 1]
-            filenames: used for disk caching
-            stain_names: used as part of cache key
+            he_tensor:   [B, 3, H, W] in [-1, 1]
+            filenames:   list[str] used for disk caching
+            stain_names: list[str] used as part of cache key
 
-        Returns dict with:
+        Returns dict:
             probs:      [B, num_classes]  softmax tissue probabilities
             top_labels: [B]               int64 class indices
             top_names:  list[str]         class name per sample
-            entropy:    [B]               normalized entropy in [0, 1]
+            entropy:    [B]               normalised entropy in [0, 1]
         """
-        he_01 = (he_tensor + 1.0) / 2.0  # [-1,1] → [0,1]
+        he_01 = (he_tensor.detach() + 1.0) / 2.0  # [-1,1] → [0,1]
+        B = he_01.shape[0]
 
-        results = {}
-        cached_probs = []
-        uncached_indices = []
+        all_probs: List[Optional[torch.Tensor]] = [None] * B
+        uncached_indices: List[int] = []
 
-        # Try loading from cache
+        # ── cache lookup ─────────────────────────────────────────────────
         if self._cache_dir is not None and filenames is not None:
             for i, fname in enumerate(filenames):
-                key = self._cache_key(fname, stain_names[i] if stain_names else "")
-                cpath = self._cache_dir / f"{key}.pt"
+                sname = stain_names[i] if stain_names else ""
+                cpath = self._cache_dir / f"{self._cache_key(fname, sname)}.pt"
                 if cpath.exists():
-                    cached_probs.append((i, torch.load(cpath, map_location="cpu")["probs"]))
+                    all_probs[i] = torch.load(cpath, map_location="cpu")["probs"].to(he_01.device)
                 else:
                     uncached_indices.append(i)
         else:
-            uncached_indices = list(range(he_01.shape[0]))
+            uncached_indices = list(range(B))
 
-        # Compute for uncached samples
-        all_probs = [None] * he_01.shape[0]
-        for (i, p) in cached_probs:
-            all_probs[i] = p.to(he_01.device)
-
+        # ── forward pass for uncached samples ────────────────────────────
         if uncached_indices:
             subset = he_01[uncached_indices]
-            embeds = self._encode_images(subset)
-            logits = embeds @ self.text_protos.T  # [B_sub, num_classes]
-            probs = F.softmax(logits / 0.07, dim=-1)
+            embeds = self._encode_images(subset)                      # [N, D]
+            logit_scale = self.model.logit_scale.exp()
+            logits = embeds @ self.text_protos.T * logit_scale        # [N, num_classes]
+            probs = logits.softmax(dim=-1)
+
             for out_i, src_i in enumerate(uncached_indices):
                 all_probs[src_i] = probs[out_i]
-                # Write cache
                 if self._cache_dir is not None and filenames is not None:
-                    self._write_cache(
-                        filenames[src_i],
-                        stain_names[src_i] if stain_names else "",
-                        probs[out_i].cpu(),
-                    )
+                    sname = stain_names[src_i] if stain_names else ""
+                    self._write_cache(filenames[src_i], sname, probs[out_i].cpu())
 
-        probs_t = torch.stack(all_probs, dim=0)  # [B, num_classes]
-        top_labels = probs_t.argmax(dim=-1)       # [B]
+        probs_t = torch.stack(all_probs, dim=0)       # [B, num_classes]
+        top_labels = probs_t.argmax(dim=-1)            # [B]
         entropy = self._normalized_entropy(probs_t)
 
         return {
@@ -218,14 +257,13 @@ class CONCHTissueClassifier(nn.Module):
 
     @staticmethod
     def _normalized_entropy(probs: torch.Tensor) -> torch.Tensor:
-        """Normalized Shannon entropy in [0, 1]."""
+        """Normalised Shannon entropy in [0, 1]."""
         eps = 1e-8
         H = -(probs * (probs + eps).log()).sum(dim=-1)
-        H_max = math.log(probs.shape[-1])
-        return H / H_max
+        return (H / math.log(probs.shape[-1])).clamp(0.0, 1.0)
 
     def _cache_key(self, filename: str, stain: str) -> str:
-        raw = f"{filename}|{stain}|{self._model_name}"
+        raw = f"{filename}|{stain}|{self._model_cfg}|{self._checkpoint_path}"
         return hashlib.md5(raw.encode()).hexdigest()
 
     def _write_cache(self, filename: str, stain: str, probs: torch.Tensor):
