@@ -200,16 +200,19 @@ class FlowUNet(nn.Module):
         # ── Encoder ──────────────────────────────────────────────────────────
         self.input_conv = nn.Conv2d(in_ch, channels[0], 3, padding=1)
         self.down_blocks: nn.ModuleList = nn.ModuleList()
+        skip_channels: List[int] = []
         ch = channels[0]
         for i, out_ch in enumerate(channels[:-1]):
             self.down_blocks.append(
                 DownBlock(ch, out_ch, self._time_proj_dim, num_res_blocks, downsample=True)
             )
+            skip_channels.append(out_ch)
             ch = out_ch
         # Last encoder block without downsampling
         self.down_blocks.append(
             DownBlock(ch, channels[-1], self._time_proj_dim, num_res_blocks, downsample=False)
         )
+        skip_channels.append(channels[-1])
         ch = channels[-1]
 
         # ── Bottleneck ────────────────────────────────────────────────────────
@@ -220,27 +223,30 @@ class FlowUNet(nn.Module):
         ])
 
         # ── Decoder ───────────────────────────────────────────────────────────
-        # Spatial resolutions for each decoder level (assuming 64x64 latent from 512 image)
-        # level0=64, level1=32, level2=16, level3=8  (downsampled by 2 each)
-        decoder_resolutions = self._decoder_resolutions(64, len(channels))
-        rev_channels = list(reversed(channels))
+        # Decoder consumes encoder skips in exact reverse order.  The previous
+        # implementation derived skip channels from a shifted channel list, which
+        # was wrong when two deepest encoder levels both have 1280 channels:
+        # actual skips are [320, 640, 1280, 1280] → reversed [1280, 1280, 640, 320].
+        decoder_skip_channels = list(reversed(skip_channels))
+        decoder_resolutions = self._decoder_resolutions(64, len(decoder_skip_channels))
 
         self.up_blocks: nn.ModuleList = nn.ModuleList()
-        for i, (in_c, skip_c, out_c) in enumerate(
-            zip(rev_channels, rev_channels[1:] + [channels[0]], rev_channels)
-        ):
+        current_ch = channels[-1]
+        for i, skip_c in enumerate(decoder_skip_channels):
+            out_c = skip_c
             res = decoder_resolutions[i]
             uni_map_ch = self.uni_map_channels.get(res, 64)
-            is_last = i == len(rev_channels) - 1
+            is_last = i == len(decoder_skip_channels) - 1
             self.up_blocks.append(
                 UpBlock(
-                    in_c, skip_c, out_c,
+                    current_ch, skip_c, out_c,
                     self._time_proj_dim,
                     uni_map_ch, uni_token_dim, stain_emb_dim,
                     cond_mode, num_res_blocks,
                     upsample=not is_last,
                 )
             )
+            current_ch = out_c
 
         # Output conv
         self.out_norm = nn.GroupNorm(min(32, channels[0]), channels[0])
@@ -251,9 +257,11 @@ class FlowUNet(nn.Module):
     @staticmethod
     def _decoder_resolutions(latent_size: int, n_levels: int) -> List[int]:
         """Return spatial resolutions at each decoder level (coarse → fine)."""
-        # encoder goes latent_size → latent_size/2 → ... → latent_size/2^(n-2)
+        # There are n_levels-1 stride-2 downsamples because the deepest encoder
+        # block does not downsample. For a 512 image with an SD VAE, latent_size
+        # is 64 and resolutions are [8, 16, 32, 64].
         resolutions = []
-        r = latent_size // (2 ** (n_levels - 2))
+        r = latent_size // (2 ** (n_levels - 1))
         for _ in range(n_levels):
             resolutions.append(r)
             r *= 2
